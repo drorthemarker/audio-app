@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Text Synchronizer - Final Logic</title>
+    <style>
+        :root { --highlight-color: #FFD700; --primary-blue: #007bff; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #f4f4f9; margin: 0; padding: 20px; box-sizing: border-box; }
+        .container { width: 90%; max-width: 900px; background: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 20px; margin-top: 15px; }
+        #text-display { height: 60vh; overflow-y: auto; border: 1px solid #ddd; padding: 15px; font-size: 24px; line-height: 2.3; text-align: right; margin-bottom: 20px; }
+        #text-display span.word { transition: background-color 0.05s linear; border-radius: 4px; }
+        #text-display span.highlight-continuous, #text-display span.highlight-chunk { background-color: var(--highlight-color); color: black; }
+        .controls, .file-loaders { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; }
+        button, label { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; background-color: var(--primary-blue); color: white; transition: background-color 0.2s; min-width: 180px; text-align: center;}
+        button:hover:not(:disabled), label:hover { opacity: 0.85; }
+        button:disabled { background-color: #a0a0a0; cursor: not-allowed; }
+        label { background-color: #5a6268; }
+        input[type="file"] { display: none; }
+        #status { font-size: 16px; color: #333; height: 20px; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <h1>מסנכרן אודיו וטקסט</h1>
+    <div class="file-loaders">
+        <label for="audio-file">1. בחר קובץ אודיו (.wav)</label>
+        <input type="file" id="audio-file" accept=".wav">
+        <label for="timestamp-file">2. בחר קובץ חותמות זמן (.txt)</label>
+        <input type="file" id="timestamp-file" accept=".txt">
+    </div>
+    <p id="status">טען את הקבצים כדי להתחיל.</p>
+    <div class="container">
+        <div id="text-display"></div>
+        <audio id="audio-player" style="width: 100%; margin-bottom: 20px;"></audio>
+        <div class="controls">
+            <button id="play-continuous-btn" disabled>נגן ברצף</button>
+            <button id="play-chunk-btn" disabled>נגן מקטע הבא</button>
+        </div>
+    </div>
+
+    <script>
+        const elements = {
+            audioPlayer: document.getElementById('audio-player'),
+            textDisplay: document.getElementById('text-display'),
+            playContinuousBtn: document.getElementById('play-continuous-btn'),
+            playChunkBtn: document.getElementById('play-chunk-btn'),
+            audioFileInput: document.getElementById('audio-file'),
+            timestampFileInput: document.getElementById('timestamp-file'),
+            status: document.getElementById('status'),
+        };
+
+        let audioContext;
+        let audioBuffer;
+        let currentChunkSource;
+
+        let state = {
+            timestamps: [],
+            wordElements: [],
+            lastHighlightedIndex: -1,
+            chunkIndex: 0,
+            isContinuousPlay: false,
+        };
+
+        function checkAllFilesLoaded() {
+            if (audioBuffer && state.timestamps.length > 0) {
+                elements.playContinuousBtn.disabled = false;
+                elements.playChunkBtn.disabled = false;
+                renderTextFromTimestamps();
+                elements.status.textContent = 'קבצים נטענו בהצלחה.';
+            }
+        }
+
+        elements.audioFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0]; if (!file) return;
+            elements.status.textContent = 'מעבד קובץ אודיו...';
+            elements.audioPlayer.src = URL.createObjectURL(file);
+            if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const arrayBuffer = await file.arrayBuffer();
+            audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            e.target.previousElementSibling.style.backgroundColor = '#28a745';
+            checkAllFilesLoaded();
+        });
+
+        elements.timestampFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0]; if (!file) return;
+            const text = await file.text();
+            state.timestamps = parseTimestamps(text);
+            e.target.previousElementSibling.style.backgroundColor = '#28a745';
+            checkAllFilesLoaded();
+        });
+        
+        function parseTime(timeStr) {
+            let s=0; const m=timeStr.match(/(\d+)m/); if(m)s+=parseInt(m[1])*60;
+            const sec=timeStr.match(/(\d+)s/); if(sec)s+=parseInt(sec[1]);
+            const ms=timeStr.match(/(\d+)ms/); if(ms)s+=parseInt(ms[1])/1000; return s;
+        }
+
+        function parseTimestamps(text) {
+            return text.split('\n').map(line => {
+                const match = line.trim().match(/\[\s*(.*?)\s*-\s*(.*?)\s*\]\s*(.*)/);
+                return match ? { start: parseTime(match[1]), end: parseTime(match[2]), word: match[3] } : null;
+            }).filter(Boolean);
+        }
+
+        function renderTextFromTimestamps() {
+            elements.textDisplay.innerHTML = '';
+            state.timestamps.forEach((ts, index) => {
+                const span = document.createElement('span');
+                span.className = 'word'; span.id = `word-${index}`; span.textContent = ts.word;
+                elements.textDisplay.appendChild(span);
+                elements.textDisplay.appendChild(document.createTextNode(' '));
+                if (ts.word.endsWith('.')) {
+                    elements.textDisplay.appendChild(document.createElement('br'));
+                }
+            });
+            state.wordElements = Array.from(elements.textDisplay.querySelectorAll('span.word'));
+        }
+
+        function continuousHighlightLoop() {
+            if (elements.audioPlayer.paused || !state.isContinuousPlay) return;
+            const currentTime = elements.audioPlayer.currentTime;
+            let activeIndex = -1;
+            for (let i = 0; i < state.timestamps.length; i++) {
+                if (currentTime >= state.timestamps[i].start && currentTime < state.timestamps[i].end) { activeIndex = i; break; }
+            }
+            if (activeIndex !== state.lastHighlightedIndex) {
+                if (state.lastHighlightedIndex !== -1) { state.wordElements[state.lastHighlightedIndex]?.classList.remove('highlight-continuous'); }
+                if (activeIndex !== -1) {
+                    const el = state.wordElements[activeIndex];
+                    el?.classList.add('highlight-continuous');
+                    const rect = el.getBoundingClientRect();
+                    const displayRect = elements.textDisplay.getBoundingClientRect();
+                    if (rect.top < displayRect.top || rect.bottom > displayRect.bottom) {
+                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+                state.lastHighlightedIndex = activeIndex;
+            }
+            requestAnimationFrame(continuousHighlightLoop);
+        }
+        
+        function clearAllHighlights() {
+            const highlights = elements.textDisplay.querySelectorAll('.highlight-continuous, .highlight-chunk');
+            highlights.forEach(el => el.classList.remove('highlight-continuous', 'highlight-chunk'));
+            state.lastHighlightedIndex = -1;
+        }
+
+        function doesWordMeetCriteria(word) {
+            if (!word) return false;
+            return word.endsWith('.') || word.endsWith(',') || word.startsWith('ו');
+        }
+
+        function calculateNextChunk() {
+            const totalWords = state.timestamps.length;
+            const startIndex = state.chunkIndex;
+            if (startIndex >= totalWords) return { startIdx: -1, endIdx: -1 };
+            if (startIndex + 4 < totalWords && doesWordMeetCriteria(state.timestamps[startIndex + 4].word)) {
+                return { startIdx: startIndex, endIdx: startIndex + 4 };
+            }
+            if (startIndex + 2 < totalWords && doesWordMeetCriteria(state.timestamps[startIndex + 2].word)) {
+                return { startIdx: startIndex, endIdx: startIndex + 2 };
+            }
+            const defaultEndIndex = Math.min(startIndex + 3, totalWords - 1);
+            return { startIdx: startIndex, endIdx: defaultEndIndex };
+        }
+
+        elements.audioPlayer.addEventListener('play', () => {
+            if (state.isContinuousPlay) {
+                elements.playContinuousBtn.textContent = 'השהה';
+                elements.playChunkBtn.disabled = true;
+                requestAnimationFrame(continuousHighlightLoop);
+            }
+        });
+        elements.audioPlayer.addEventListener('pause', () => {
+            elements.playContinuousBtn.textContent = 'נגן ברצף';
+            elements.playChunkBtn.disabled = false;
+        });
+        elements.audioPlayer.addEventListener('ended', () => {
+            clearAllHighlights();
+            state.chunkIndex = 0;
+            state.isContinuousPlay = false;
+            elements.playContinuousBtn.textContent = 'נגן ברצף';
+        });
+        
+        elements.playContinuousBtn.addEventListener('click', () => {
+            if(currentChunkSource) currentChunkSource.stop();
+            if (elements.audioPlayer.paused) {
+                clearAllHighlights();
+                state.isContinuousPlay = true;
+                if (elements.audioPlayer.currentTime >= elements.audioPlayer.duration) {
+                    elements.audioPlayer.currentTime = 0;
+                }
+                elements.audioPlayer.play();
+            } else {
+                elements.audioPlayer.pause();
+            }
+        });
+
+        elements.playChunkBtn.addEventListener('click', () => {
+            if (!audioContext || !audioBuffer) return;
+            elements.audioPlayer.pause();
+            if(currentChunkSource) currentChunkSource.stop();
+
+            const { startIdx, endIdx } = calculateNextChunk();
+
+            if (startIdx === -1) {
+                elements.status.textContent = "הגעת לסוף. לחץ שוב כדי להתחיל מחדש.";
+                state.chunkIndex = 0;
+                clearAllHighlights();
+                return;
+            }
+            
+            clearAllHighlights();
+            state.isContinuousPlay = false;
+
+            const startTime = state.timestamps[startIdx].start;
+            // --- THE CRITICAL LOGIC CHANGE ---
+            // The audio stops at the END of the LAST highlighted word.
+            const stopTime = state.timestamps[endIdx].end;
+            
+            const safeStartTime = Math.max(0, startTime);
+            // Add a tiny buffer to duration to avoid clipping the last syllable
+            const duration = Math.max(0, (stopTime - safeStartTime) + 0.1); 
+
+            for (let i = startIdx; i <= endIdx; i++) {
+                state.wordElements[i]?.classList.add('highlight-chunk');
+            }
+            state.wordElements[startIdx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            
+            currentChunkSource = audioContext.createBufferSource();
+            currentChunkSource.buffer = audioBuffer;
+            currentChunkSource.connect(audioContext.destination);
+            currentChunkSource.start(0, safeStartTime, duration);
+
+            elements.playContinuousBtn.disabled = true;
+            elements.playChunkBtn.disabled = true;
+            
+            currentChunkSource.onended = () => {
+                elements.playContinuousBtn.disabled = false;
+                elements.playChunkBtn.disabled = false;
+            };
+            
+            state.chunkIndex = endIdx + 1;
+        });
+    </script>
+</body>
+</html>
